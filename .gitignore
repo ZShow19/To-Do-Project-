@@ -13,4 +13,6 @@ frontend/flutter_*.log
 # IDE
 .idea/
 .vscode/*.log
-**/todo.db-shm`n**/todo.db-wal
+**/todo.db-shm
+**/todo.db-wal
+
