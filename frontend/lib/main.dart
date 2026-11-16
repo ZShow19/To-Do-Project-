@@ -496,6 +496,7 @@ class AppStore extends ChangeNotifier {
     try {
       todayLog = await api.saveDailyLog(todayLog);
     } catch (_) {}
+    await refreshStats(notify: false);
     notifyListeners();
   }
 
@@ -505,6 +506,7 @@ class AppStore extends ChangeNotifier {
     } catch (_) {
       meals.add(meal);
     }
+    await refreshStats(notify: false);
     notifyListeners();
   }
 
@@ -533,6 +535,7 @@ class AppStore extends ChangeNotifier {
     try {
       if (meal.id.isNotEmpty) await api.deleteMeal(meal.id);
     } catch (_) {}
+    await refreshStats(notify: false);
     notifyListeners();
   }
 
