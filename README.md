@@ -36,3 +36,7 @@ Frontend подключается к API по адресу `http://localhost:510
 powershell -ExecutionPolicy Bypass -File .\scripts\run-backend.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\run-frontend.ps1
 ```
+
+## Требования для Windows-сборки
+
+Для `flutter build windows` нужен Visual Studio Build Tools с компонентом `Microsoft.VisualStudio.Workload.NativeDesktop` и Windows 10/11 SDK.
