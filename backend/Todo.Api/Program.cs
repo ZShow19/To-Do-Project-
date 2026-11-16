@@ -140,7 +140,7 @@ app.MapGet("/api/stats", async (DateOnly? from, DateOnly? to, TodoDbContext db) 
     if (start > end) return Results.BadRequest("from must be on or before to");
     return Results.Ok(await StatsService.BuildAsync(db, start, end));
 });
-app.MapGet("/api/export", async (TodoDbContext db) => Results.Ok(new { exportedAtUtc = DateTime.UtcNow, tasks = await db.Tasks.AsNoTracking().ToListAsync(), dailyLogs = await db.DailyLogs.AsNoTracking().ToListAsync(), products = await db.FoodProducts.AsNoTracking().ToListAsync(), meals = await db.MealEntries.AsNoTracking().ToListAsync(), settings = await db.UserSettings.AsNoTracking().FirstOrDefaultAsync() }));
+app.MapGet("/api/export", async (TodoDbContext db) => Results.Ok(new { exportedAtUtc = DateTime.UtcNow, tasks = await db.Tasks.AsNoTracking().ToListAsync(), dailyLogs = await db.DailyLogs.AsNoTracking().ToListAsync(), products = await db.FoodProducts.AsNoTracking().ToListAsync(), meals = await db.MealEntries.AsNoTracking().ToListAsync(), settings = await db.UserSettings.AsNoTracking().SingleOrDefaultAsync(x => x.Id == 1) }));
 
 static DateTime? NormalizeUtc(DateTime? value) => value?.Kind switch
 {

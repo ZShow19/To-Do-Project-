@@ -1,9 +1,11 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 const _ink = Color(0xFF1A1A1A);
@@ -48,6 +50,9 @@ class ApiClient {
       .toList();
   Future<TaskItem> createTask(TaskItem task) async =>
       TaskItem.fromJson(await _send('POST', '/tasks', task.toJson()));
+  Future<TaskItem> updateTask(TaskItem task) async => TaskItem.fromJson(
+    await _send('PUT', '/tasks/${task.id}', task.toJson()),
+  );
   Future<TaskItem> completeTask(String id, bool value) async =>
       TaskItem.fromJson(
         await _send('PATCH', '/tasks/$id/complete', {'isCompleted': value}),
@@ -84,6 +89,12 @@ class ApiClient {
 
 String dateKey(DateTime value) =>
     '${value.year.toString().padLeft(4, '0')}-${value.month.toString().padLeft(2, '0')}-${value.day.toString().padLeft(2, '0')}';
+DateTime todayDeadlineUtc() {
+  final now = DateTime.now();
+  // Noon UTC keeps the user's calendar date stable across ordinary time zones.
+  return DateTime.utc(now.year, now.month, now.day, 12);
+}
+
 String dateLabel(DateTime value) =>
     '${value.day.toString().padLeft(2, '0')}.${value.month.toString().padLeft(2, '0')}.${value.year}';
 
@@ -92,8 +103,8 @@ class TaskItem {
     this.id = '',
     required this.title,
     this.description = '',
-    this.category = 'Р вЂєР С‘РЎвЂЎР Р…Р С•Р Вµ',
-    this.priority = 'Р РЋРЎР‚Р ВµР Т‘Р Р…Р С‘Р в„–',
+    this.category = 'Личное',
+    this.priority = 'Средний',
     this.dueDate,
     this.isCompleted = false,
     this.completedAt,
@@ -107,8 +118,8 @@ class TaskItem {
     id: '${json['id'] ?? ''}',
     title: json['title'] ?? '',
     description: json['description'] ?? '',
-    category: json['category'] ?? 'Р вЂєР С‘РЎвЂЎР Р…Р С•Р Вµ',
-    priority: json['priority'] ?? 'Р РЋРЎР‚Р ВµР Т‘Р Р…Р С‘Р в„–',
+    category: json['category'] ?? 'Личное',
+    priority: json['priority'] ?? 'Средний',
     dueDate: json['dueDateUtc'] == null
         ? null
         : DateTime.tryParse(json['dueDateUtc']),
@@ -200,12 +211,12 @@ class MealEntry {
   factory MealEntry.fromJson(Map<String, dynamic> json) {
     final product = FoodProduct.fromJson(
       (json['product'] as Map?)?.cast<String, dynamic>() ??
-          {'id': json['productId'], 'name': 'Р СџРЎР‚Р С•Р Т‘РЎС“Р С”РЎвЂљ'},
+          {'id': json['productId'], 'name': 'Продукт'},
     );
     return MealEntry(
       id: '${json['id'] ?? ''}',
       date: DateTime.tryParse(json['date'] ?? '') ?? DateTime.now(),
-      mealType: json['mealType'] ?? 'Р СџР ВµРЎР‚Р ВµР С”РЎС“РЎРѓ',
+      mealType: json['mealType'] ?? 'Перекус',
       product: product,
       weight: (json['weightGrams'] as num?)?.toDouble() ?? 0,
       calories: (json['calculatedCalories'] as num?)?.toDouble() ?? 0,
@@ -323,6 +334,9 @@ class AppStore extends ChangeNotifier {
   List<FoodProduct> products = [];
   List<MealEntry> meals = [];
   List<DayStat> stats = [];
+  List<DayStat> previousStats = [];
+  DateTime statsFrom = DateTime.now().subtract(const Duration(days: 29));
+  DateTime statsTo = DateTime.now();
   DailyLog todayLog = DailyLog(date: DateTime.now());
   UserSettings settings = UserSettings();
   int get completedToday => tasks
@@ -376,14 +390,7 @@ class AppStore extends ChangeNotifier {
     try {
       meals = await api.meals(DateTime.now());
     } catch (_) {}
-    try {
-      stats = (await api.stats(
-        DateTime.now().subtract(const Duration(days: 30)),
-        DateTime.now(),
-      )).days;
-    } catch (_) {
-      stats = _demoStats();
-    }
+    await loadStatsForPeriod('30 дней', notify: false);
     loading = false;
     notifyListeners();
   }
@@ -405,12 +412,17 @@ class AppStore extends ChangeNotifier {
 
   Future<void> addTask(String title) async {
     if (title.trim().isEmpty) return;
-    final task = TaskItem(title: title.trim(), dueDate: DateTime.now());
+    final task = TaskItem(title: title.trim(), dueDate: todayDeadlineUtc());
+    await addTaskFromDialog(task);
+  }
+
+  Future<void> addTaskFromDialog(TaskItem task) async {
     try {
       tasks.insert(0, await api.createTask(task));
     } catch (_) {
       tasks.insert(0, task);
     }
+    await refreshStats(notify: false);
     notifyListeners();
   }
 
@@ -421,6 +433,19 @@ class AppStore extends ChangeNotifier {
       final updated = await api.completeTask(task.id, value);
       task.isCompleted = updated.isCompleted;
     } catch (_) {}
+    await refreshStats(notify: false);
+    notifyListeners();
+  }
+
+  Future<void> updateTask(TaskItem task) async {
+    final index = tasks.indexWhere((item) => item.id == task.id);
+    if (index < 0) return;
+    try {
+      tasks[index] = await api.updateTask(task);
+    } catch (_) {
+      tasks[index] = task;
+    }
+    await refreshStats(notify: false);
     notifyListeners();
   }
 
@@ -429,7 +454,42 @@ class AppStore extends ChangeNotifier {
     try {
       if (task.id.isNotEmpty) await api.deleteTask(task.id);
     } catch (_) {}
+    await refreshStats(notify: false);
     notifyListeners();
+  }
+
+  Future<void> refreshStats({bool notify = true}) async {
+    try {
+      stats = (await api.stats(statsFrom, statsTo)).days;
+    } catch (_) {
+      stats = _localStats(statsFrom, statsTo);
+    }
+    if (notify) notifyListeners();
+  }
+
+  Future<void> loadStatsForPeriod(String period, {bool notify = true}) async {
+    final end = DateTime.now();
+    final span = period == '7 дней'
+        ? 7
+        : period == 'Год'
+        ? 365
+        : 30;
+    statsTo = DateTime(end.year, end.month, end.day);
+    statsFrom = statsTo.subtract(Duration(days: span - 1));
+    final previousTo = statsFrom.subtract(const Duration(days: 1));
+    final previousFrom = previousTo.subtract(Duration(days: span - 1));
+    try {
+      final data = await Future.wait<StatsData>([
+        api.stats(statsFrom, statsTo),
+        api.stats(previousFrom, previousTo),
+      ]);
+      stats = data[0].days;
+      previousStats = data[1].days;
+    } catch (_) {
+      stats = _localStats(statsFrom, statsTo);
+      previousStats = _localStats(previousFrom, previousTo);
+    }
+    if (notify) notifyListeners();
   }
 
   Future<void> saveLog() async {
@@ -446,6 +506,26 @@ class AppStore extends ChangeNotifier {
       meals.add(meal);
     }
     notifyListeners();
+  }
+
+  Future<void> loadMealsForDate(DateTime date, {bool notify = true}) async {
+    try {
+      meals = await api.meals(date);
+    } catch (_) {
+      meals = [];
+    }
+    if (notify) notifyListeners();
+  }
+
+  Future<FoodProduct?> addProduct(FoodProduct product) async {
+    try {
+      final saved = await api.createProduct(product);
+      products = [...products, saved];
+      notifyListeners();
+      return saved;
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<void> removeMeal(MealEntry meal) async {
@@ -474,17 +554,25 @@ class AppStore extends ChangeNotifier {
     }
   }
 
-  List<TaskItem> filteredTasks(String filter) {
+  List<TaskItem> filteredTasks(
+    String filter, {
+    String? category,
+    String? priority,
+  }) {
     final list = tasks.where((t) {
       if (search.isNotEmpty &&
           !('${t.title} ${t.description} ${t.category}'.toLowerCase().contains(
             search.toLowerCase(),
           )))
         return false;
-      if (filter == 'Р вЂ™РЎвЂ№Р С—Р С•Р В»Р Р…Р ВµР Р…Р С•')
+      if (category != null && category != 'Все' && t.category != category)
+        return false;
+      if (priority != null && priority != 'Все' && t.priority != priority)
+        return false;
+      if (filter == 'Выполнено')
         return t.isCompleted;
-      if (filter == 'Р вЂ™ РЎР‚Р В°Р В±Р С•РЎвЂљР Вµ') return !t.isCompleted;
-      if (filter == 'Р СџРЎР‚Р С•РЎРѓРЎР‚Р С•РЎвЂЎР ВµР Р…Р С•')
+      if (filter == 'В работе') return !t.isCompleted;
+      if (filter == 'Просрочено')
         return !t.isCompleted &&
             t.dueDate != null &&
             t.dueDate!.isBefore(DateTime.now());
@@ -493,47 +581,69 @@ class AppStore extends ChangeNotifier {
     return list;
   }
 
+  List<DayStat> _localStats(DateTime from, DateTime to) {
+    final result = <DayStat>[];
+    for (var day = DateTime(from.year, from.month, from.day);
+        !day.isAfter(DateTime(to.year, to.month, to.day));
+        day = day.add(const Duration(days: 1))) {
+      final dayTasks = tasks.where((task) => _sameDay(task.dueDate ?? task.createdAt, day));
+      final planned = dayTasks.length;
+      final completed = dayTasks.where((task) => task.isCompleted).length;
+      result.add(DayStat(
+        date: day,
+        planned: planned,
+        completed: completed,
+        status: completed == 0
+            ? 'empty'
+            : completed == planned
+            ? 'complete'
+            : 'partial',
+      ));
+    }
+    return result;
+  }
+
   bool _sameDay(DateTime a, DateTime b) =>
       a.year == b.year && a.month == b.month && a.day == b.day;
   List<TaskItem> _demoTasks() => [
     TaskItem(
-      title: 'Р РЋР С•РЎРѓРЎвЂљР В°Р Р†Р С‘РЎвЂљРЎРЉ Р С—Р В»Р В°Р Р… Р Т‘Р Р…РЎРЏ',
-      category: 'Р вЂєР С‘РЎвЂЎР Р…Р С•Р Вµ',
-      priority: 'Р вЂ™РЎвЂ№РЎРѓР С•Р С”Р С‘Р в„–',
+      title: 'Составить план дня',
+      category: 'Личное',
+      priority: 'Высокий',
       dueDate: DateTime.now(),
       isCompleted: true,
     ),
     TaskItem(
       title:
-          'Р СћРЎР‚Р ВµР Р…Р С‘РЎР‚Р С•Р Р†Р С”Р В° 45 Р СР С‘Р Р…РЎС“РЎвЂљ',
-      category: 'Р РЋР С—Р С•РЎР‚РЎвЂљ',
-      priority: 'Р РЋРЎР‚Р ВµР Т‘Р Р…Р С‘Р в„–',
+          'Тренировка 45 минут',
+      category: 'Спорт',
+      priority: 'Средний',
       dueDate: DateTime.now(),
     ),
     TaskItem(
-      title: 'Р СџРЎР‚Р С•РЎвЂЎР С‘РЎвЂљР В°РЎвЂљРЎРЉ Р С–Р В»Р В°Р Р†РЎС“ Р С”Р Р…Р С‘Р С–Р С‘',
-      category: 'Р Р€РЎвЂЎРЎвЂР В±Р В°',
-      priority: 'Р СњР С‘Р В·Р С”Р С‘Р в„–',
+      title: 'Прочитать главу книги',
+      category: 'Учёба',
+      priority: 'Низкий',
       dueDate: DateTime.now(),
     ),
     TaskItem(
-      title: 'Р В Р В°Р В·Р С•Р В±РЎР‚Р В°РЎвЂљРЎРЉ Р С—Р С•РЎвЂЎРЎвЂљРЎС“',
-      category: 'Р В Р В°Р В±Р С•РЎвЂљР В°',
-      priority: 'Р РЋРЎР‚Р ВµР Т‘Р Р…Р С‘Р в„–',
+      title: 'Разобрать почту',
+      category: 'Работа',
+      priority: 'Средний',
       dueDate: DateTime.now(),
     ),
   ];
   List<FoodProduct> _demoProducts() => [
     FoodProduct(
       id: 'chicken',
-      name: 'Р С™РЎС“РЎР‚Р С‘Р Р…Р В°РЎРЏ Р С–РЎР‚РЎС“Р Т‘Р С”Р В°',
+      name: 'Куриная грудка',
       calories: 165,
       protein: 31,
       fat: 3.6,
     ),
     FoodProduct(
       id: 'rice',
-      name: 'Р В Р С‘РЎРѓ',
+      name: 'Рис',
       calories: 344,
       protein: 6.7,
       fat: .7,
@@ -541,28 +651,13 @@ class AppStore extends ChangeNotifier {
     ),
     FoodProduct(
       id: 'banana',
-      name: 'Р вЂР В°Р Р…Р В°Р Р…',
+      name: 'Банан',
       calories: 89,
       protein: 1.1,
       fat: .3,
       carbs: 23,
     ),
   ];
-  List<DayStat> _demoStats() => List.generate(31, (i) {
-    final d = DateTime.now().subtract(Duration(days: 30 - i));
-    final done = i % 5 == 0 ? 0 : i % 3 + 1;
-    return DayStat(
-      date: d,
-      planned: 4,
-      completed: done,
-      status: done == 0
-          ? 'empty'
-          : done == 4
-          ? 'complete'
-          : 'partial',
-      productivity: done == 0 ? 0 : 5 + (i % 5) / 2,
-    );
-  });
 }
 
 class TodoApp extends StatelessWidget {
@@ -572,7 +667,7 @@ class TodoApp extends StatelessWidget {
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: store,
     builder: (_, __) => MaterialApp(
-      title: 'Р РЋР Р†Р С•Р в„– Р Т‘Р ВµР Р…РЎРЉ',
+      title: 'Свой день',
       debugShowCheckedModeBanner: false,
       theme: _theme(Brightness.light),
       darkTheme: _theme(Brightness.dark),
@@ -630,17 +725,19 @@ class AppShell extends StatefulWidget {
 
 class _AppShellState extends State<AppShell> {
   final searchController = TextEditingController();
+  final searchFocusNode = FocusNode();
   final quickController = TextEditingController();
   final titles = [
-    'Р вЂњР В»Р В°Р Р†Р Р…Р В°РЎРЏ',
-    'Р вЂ”Р В°Р Т‘Р В°РЎвЂЎР С‘',
-    'Р РЋРЎвЂљР В°РЎвЂљР С‘РЎРѓРЎвЂљР С‘Р С”Р В°',
-    'Р СџР С‘РЎвЂљР В°Р Р…Р С‘Р Вµ Р С‘ Р вЂР вЂ“Р Р€',
+    'Главная',
+    'Задачи',
+    'Статистика',
+    'Питание и БЖУ',
   ];
 
   @override
   void dispose() {
     searchController.dispose();
+    searchFocusNode.dispose();
     quickController.dispose();
     super.dispose();
   }
@@ -652,12 +749,18 @@ class _AppShellState extends State<AppShell> {
       shortcuts: <LogicalKeySet, Intent>{
         LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyK):
             const ActivateIntent(),
+        LogicalKeySet(LogicalKeyboardKey.meta, LogicalKeyboardKey.keyK):
+            const ActivateIntent(),
       },
       child: Actions(
         actions: <Type, Action<Intent>>{
           ActivateIntent: CallbackAction<Intent>(
             onInvoke: (_) {
-              FocusScope.of(context).requestFocus(FocusNode());
+              searchFocusNode.requestFocus();
+              searchController.selection = TextSelection(
+                baseOffset: 0,
+                extentOffset: searchController.text.length,
+              );
               return null;
             },
           ),
@@ -665,7 +768,11 @@ class _AppShellState extends State<AppShell> {
         child: Scaffold(
           body: Column(
             children: [
-              TopBar(store: widget.store, controller: searchController),
+              TopBar(
+                store: widget.store,
+                controller: searchController,
+                focusNode: searchFocusNode,
+              ),
               Expanded(
                 child: Row(
                   children: [
@@ -711,9 +818,15 @@ class _AppShellState extends State<AppShell> {
 }
 
 class TopBar extends StatelessWidget {
-  const TopBar({super.key, required this.store, required this.controller});
+  const TopBar({
+    super.key,
+    required this.store,
+    required this.controller,
+    required this.focusNode,
+  });
   final AppStore store;
   final TextEditingController controller;
+  final FocusNode focusNode;
   @override
   Widget build(BuildContext context) => Container(
     height: 72,
@@ -734,7 +847,7 @@ class TopBar extends StatelessWidget {
             ),
             const SizedBox(width: 10),
             const Text(
-              'Р РЋР Р†Р С•Р в„– Р Т‘Р ВµР Р…РЎРЉ',
+              'Свой день',
               style: TextStyle(
                 color: Colors.white,
                 fontSize: 18,
@@ -749,13 +862,24 @@ class TopBar extends StatelessWidget {
             constraints: const BoxConstraints(maxWidth: 500),
             child: TextField(
               controller: controller,
+              focusNode: focusNode,
               onChanged: (v) {
                 store.search = v;
                 store.refresh();
               },
+              onSubmitted: (value) {
+                final query = value.trim().toLowerCase();
+                if (query.isEmpty) return;
+                store.page = store.products.any(
+                  (product) => product.name.toLowerCase().contains(query),
+                )
+                    ? 3
+                    : 1;
+                store.refresh();
+              },
               style: const TextStyle(color: Colors.white),
               decoration: InputDecoration(
-                hintText: 'Р СџР С•Р С‘РЎРѓР С” Р В·Р В°Р Т‘Р В°РЎвЂЎ Р С‘ Р С—РЎР‚Р С•Р Т‘РЎС“Р С”РЎвЂљР С•Р Р†',
+                hintText: 'Поиск задач и продуктов',
                 hintStyle: TextStyle(color: Colors.white54),
                 prefixIcon: const Icon(Icons.search, color: Colors.white60),
                 suffixIcon: Padding(
@@ -791,7 +915,7 @@ class TopBar extends StatelessWidget {
               ),
               const SizedBox(width: 5),
               Text(
-                '${store.streak} Р Т‘Р Р…Р ВµР в„–',
+                '${store.streak} дней',
                 style: const TextStyle(
                   color: Colors.white,
                   fontWeight: FontWeight.w600,
@@ -805,7 +929,7 @@ class TopBar extends StatelessWidget {
           radius: 18,
           backgroundColor: Color(0xFF8A84FF),
           child: Text(
-            'Р С’',
+            'А',
             style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700),
           ),
         ),
@@ -846,7 +970,7 @@ class Sidebar extends StatelessWidget {
           context,
           4,
           Icons.settings_outlined,
-          'Р СњР В°РЎРѓРЎвЂљРЎР‚Р С•Р в„–Р С”Р С‘',
+          'Настройки',
         ),
       ],
     ),
@@ -951,8 +1075,8 @@ class DashboardPage extends StatelessWidget {
     return ListView(
       children: [
         const PageTitle(
-          title: 'Р”РѕР±СЂС‹Р№ РґРµРЅСЊ, РђРЅРґСЂРµР№',
-          subtitle: 'РЎРѕР±РµСЂС‘Рј СЃРїРѕРєРѕР№РЅС‹Р№ Рё РїСЂРѕРґСѓРєС‚РёРІРЅС‹Р№ РґРµРЅСЊ.',
+          title: 'Добрый день, Андрей',
+          subtitle: 'Соберём спокойный и продуктивный день.',
         ),
         const SizedBox(height: 22),
         Row(
@@ -966,7 +1090,7 @@ class DashboardPage extends StatelessWidget {
                 },
                 decoration: const InputDecoration(
                   prefixIcon: Icon(Icons.add_task_rounded),
-                  hintText: 'Р‘С‹СЃС‚СЂРѕ РґРѕР±Р°РІРёС‚СЊ Р·Р°РґР°С‡Сѓ Рё РЅР°Р¶Р°С‚СЊ Enter',
+                  hintText: 'Быстро добавить задачу и нажать Enter',
                 ),
               ),
             ),
@@ -977,7 +1101,7 @@ class DashboardPage extends StatelessWidget {
                 quickController.clear();
               },
               icon: const Icon(Icons.add),
-              label: const Text('Р”РѕР±Р°РІРёС‚СЊ'),
+              label: const Text('Добавить'),
             ),
           ],
         ),
@@ -998,7 +1122,7 @@ class DashboardPage extends StatelessWidget {
               childAspectRatio: 2.2,
               children: [
                 _KpiCard(
-                  title: 'Р—Р°РґР°С‡Рё Р·Р° РґРµРЅСЊ',
+                  title: 'Задачи за день',
                   value: '${store.completedToday} / ${today.length}',
                   icon: Icons.task_alt_rounded,
                   color: _accent,
@@ -1008,15 +1132,15 @@ class DashboardPage extends StatelessWidget {
                   },
                 ),
                 _KpiCard(
-                  title: 'РџСЂРѕРґСѓРєС‚РёРІРЅРѕСЃС‚СЊ РґРЅСЏ',
+                  title: 'Продуктивность дня',
                   value: '${store.todayLog.score.toStringAsFixed(1)} / 10',
                   icon: Icons.bolt_rounded,
                   color: _orange,
                 ),
                 _KpiCard(
-                  title: 'РљР°Р»РѕСЂРёРё Рё Р‘Р–РЈ',
+                  title: 'Калории и БЖУ',
                   value:
-                      '${store.meals.fold<double>(0, (s, m) => s + m.calories).round()} РєРєР°Р»',
+                      '${store.meals.fold<double>(0, (s, m) => s + m.calories).round()} ккал',
                   icon: Icons.local_fire_department_outlined,
                   color: const Color(0xFFE85D75),
                   onTap: () {
@@ -1025,8 +1149,8 @@ class DashboardPage extends StatelessWidget {
                   },
                 ),
                 _KpiCard(
-                  title: 'РЎС‚СЂРёРє',
-                  value: '${store.streak} РґРЅРµР№',
+                  title: 'Стрик',
+                  value: '${store.streak} дней',
                   icon: Icons.local_fire_department_rounded,
                   color: _green,
                   onTap: () {
@@ -1136,7 +1260,7 @@ class _ProductivityEditor extends StatelessWidget {
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
       const Text(
-        'Р С›РЎвЂ Р ВµР Р…Р С”Р В° Р С—РЎР‚Р С•Р Т‘РЎС“Р С”РЎвЂљР С‘Р Р†Р Р…Р С•РЎРѓРЎвЂљР С‘',
+        'Оценка продуктивности',
         style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
       ),
       const SizedBox(height: 8),
@@ -1164,14 +1288,14 @@ class _ProductivityEditor extends StatelessWidget {
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           Text(
-            'Р СњР С‘Р В·Р С”Р В°РЎРЏ',
+            'Низкая',
             style: TextStyle(
               color: Theme.of(context).colorScheme.onSurfaceVariant,
               fontSize: 12,
             ),
           ),
           Text(
-            'Р СљР В°Р С”РЎРѓР С‘Р СРЎС“Р С',
+            'Максимум',
             style: TextStyle(
               color: Theme.of(context).colorScheme.onSurfaceVariant,
               fontSize: 12,
@@ -1190,7 +1314,7 @@ class _ProductivityEditor extends StatelessWidget {
         onEditingComplete: store.saveLog,
         decoration: const InputDecoration(
           labelText:
-              'Р С™Р В°Р С” Р С—РЎР‚Р С•РЎв‚¬РЎвЂР В» Р Т‘Р ВµР Р…РЎРЉ?',
+              'Как прошёл день?',
           alignLabelWithHint: true,
         ),
       ),
@@ -1211,7 +1335,7 @@ class _TodayTasks extends StatelessWidget {
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             const Text(
-              'Р вЂ”Р В°Р Т‘Р В°РЎвЂЎР С‘ Р Р…Р В° РЎРѓР ВµР С–Р С•Р Т‘Р Р…РЎРЏ',
+              'Задачи на сегодня',
               style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
             ),
             TextButton(
@@ -1219,7 +1343,7 @@ class _TodayTasks extends StatelessWidget {
                 store.page = 1;
                 store.refresh();
               },
-              child: const Text('Р вЂ™РЎРѓР Вµ Р В·Р В°Р Т‘Р В°РЎвЂЎР С‘'),
+              child: const Text('Все задачи'),
             ),
           ],
         ),
@@ -1229,7 +1353,7 @@ class _TodayTasks extends StatelessWidget {
             padding: EdgeInsets.all(20),
             child: Center(
               child: Text(
-                'Р вЂќР С•Р В±Р В°Р Р†РЎРЉРЎвЂљР Вµ Р С—Р ВµРЎР‚Р Р†РЎС“РЎР‹ Р В·Р В°Р Т‘Р В°РЎвЂЎРЎС“',
+                'Добавьте первую задачу',
               ),
             ),
           ),
@@ -1274,9 +1398,9 @@ class _PriorityBadge extends StatelessWidget {
   final String value;
   @override
   Widget build(BuildContext context) {
-    final color = value == 'Р вЂ™РЎвЂ№РЎРѓР С•Р С”Р С‘Р в„–'
+    final color = value == 'Высокий'
         ? const Color(0xFFD9534F)
-        : value == 'Р СњР С‘Р В·Р С”Р С‘Р в„–'
+        : value == 'Низкий'
         ? _green
         : _orange;
     return Container(
@@ -1305,7 +1429,7 @@ class _MiniHeatmap extends StatelessWidget {
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
       const Text(
-        'Р С’Р С”РЎвЂљР С‘Р Р†Р Р…Р С•РЎРѓРЎвЂљРЎРЉ Р В·Р В° Р С—Р С•РЎРѓР В»Р ВµР Т‘Р Р…Р С‘Р Вµ Р Р…Р ВµР Т‘Р ВµР В»Р С‘',
+        'Активность за последние недели',
         style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
       ),
       const SizedBox(height: 14),
@@ -1318,7 +1442,7 @@ class _MiniHeatmap extends StatelessWidget {
               : (store.stats[i % store.stats.length].completed);
           return Tooltip(
             message:
-                'Р вЂќР ВµР Р…РЎРЉ Р В°Р С”РЎвЂљР С‘Р Р†Р Р…Р С•РЎРѓРЎвЂљР С‘',
+                'День активности',
             child: Container(
               width: 16,
               height: 16,
@@ -1344,8 +1468,12 @@ class TasksPage extends StatefulWidget {
 }
 
 class _TasksPageState extends State<TasksPage> {
-  String filter = 'Р’СЃРµ';
+  String filter = 'Все';
+  String categoryFilter = 'Все';
+  String priorityFilter = 'Все';
   final search = TextEditingController();
+  static const categories = ['Все', 'Личное', 'Учёба', 'Спорт', 'Работа'];
+  static const priorities = ['Все', 'Высокий', 'Средний', 'Низкий'];
   @override
   void dispose() {
     search.dispose();
@@ -1354,7 +1482,11 @@ class _TasksPageState extends State<TasksPage> {
 
   @override
   Widget build(BuildContext context) {
-    final list = widget.store.filteredTasks(filter);
+    final list = widget.store.filteredTasks(
+      filter,
+      category: categoryFilter,
+      priority: priorityFilter,
+    );
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1362,13 +1494,13 @@ class _TasksPageState extends State<TasksPage> {
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             const PageTitle(
-              title: 'Р—Р°РґР°С‡Рё',
-              subtitle: 'РџР»Р°РЅРёСЂСѓР№С‚Рµ, РІС‹РїРѕР»РЅСЏР№С‚Рµ Рё РґРµСЂР¶РёС‚Рµ С„РѕРєСѓСЃ.',
+              title: 'Задачи',
+              subtitle: 'Планируйте, выполняйте и держите фокус.',
             ),
             FilledButton.icon(
               onPressed: () => _addTask(context),
               icon: const Icon(Icons.add),
-              label: const Text('Р”РѕР±Р°РІРёС‚СЊ Р·Р°РґР°С‡Сѓ'),
+              label: const Text('Добавить задачу'),
             ),
           ],
         ),
@@ -1384,7 +1516,7 @@ class _TasksPageState extends State<TasksPage> {
                 },
                 decoration: const InputDecoration(
                   prefixIcon: Icon(Icons.search),
-                  hintText: 'Р¤РёР»СЊС‚СЂ РїРѕ РЅР°Р·РІР°РЅРёСЋ, РѕРїРёСЃР°РЅРёСЋ РёР»Рё РєР°С‚РµРіРѕСЂРёРё',
+                  hintText: 'Фильтр по названию, описанию или категории',
                 ),
               ),
             ),
@@ -1393,16 +1525,34 @@ class _TasksPageState extends State<TasksPage> {
               initialValue: filter,
               onSelected: (v) => setState(() => filter = v),
               itemBuilder: (_) => [
-                'Р’СЃРµ',
-                'Р’ СЂР°Р±РѕС‚Рµ',
-                'Р’С‹РїРѕР»РЅРµРЅРѕ',
-                'РџСЂРѕСЃСЂРѕС‡РµРЅРѕ',
+                'Все',
+                'В работе',
+                'Выполнено',
+                'Просрочено',
               ].map((x) => PopupMenuItem(value: x, child: Text(x))).toList(),
               child: OutlinedButton.icon(
                 onPressed: null,
                 icon: const Icon(Icons.filter_list),
                 label: Text(filter),
               ),
+            ),
+            const SizedBox(width: 10),
+            DropdownButton<String>(
+              value: categoryFilter,
+              underline: const SizedBox.shrink(),
+              onChanged: (value) => setState(() => categoryFilter = value ?? categoryFilter),
+              items: categories
+                  .map((value) => DropdownMenuItem(value: value, child: Text(value)))
+                  .toList(),
+            ),
+            const SizedBox(width: 10),
+            DropdownButton<String>(
+              value: priorityFilter,
+              underline: const SizedBox.shrink(),
+              onChanged: (value) => setState(() => priorityFilter = value ?? priorityFilter),
+              items: priorities
+                  .map((value) => DropdownMenuItem(value: value, child: Text(value)))
+                  .toList(),
             ),
           ],
         ),
@@ -1412,15 +1562,21 @@ class _TasksPageState extends State<TasksPage> {
             child: list.isEmpty
                 ? const Center(
                     child: Text(
-                      'Р—Р°РґР°С‡ РїРѕ РІС‹Р±СЂР°РЅРЅРѕРјСѓ С„РёР»СЊС‚СЂСѓ РЅРµС‚',
+                      'Задач по выбранному фильтру нет',
                     ),
                   )
                 : ListView.separated(
                     padding: const EdgeInsets.all(12),
-                    itemCount: list.length,
+                    itemCount: list.length + 1,
                     separatorBuilder: (_, __) => const Divider(height: 1),
-                    itemBuilder: (_, i) =>
-                        _TaskTableRow(task: list[i], store: widget.store),
+                    itemBuilder: (_, i) {
+                      if (i == 0) return const _TaskTableHeader();
+                      return _TaskTableRow(
+                        task: list[i - 1],
+                        store: widget.store,
+                        onEdit: () => _editTask(context, list[i - 1]),
+                      );
+                    },
                   ),
           ),
         ),
@@ -1429,15 +1585,29 @@ class _TasksPageState extends State<TasksPage> {
   }
 
   Future<void> _addTask(BuildContext context) async {
+    await _openTaskDialog(context);
+  }
+
+  Future<void> _editTask(BuildContext context, TaskItem task) async {
+    await _openTaskDialog(context, existing: task);
+  }
+
+  Future<void> _openTaskDialog(
+    BuildContext context, {
+    TaskItem? existing,
+  }) async {
     final title = TextEditingController();
     final description = TextEditingController();
-    String category = 'Р›РёС‡РЅРѕРµ';
-    String priority = 'РЎСЂРµРґРЅРёР№';
+    title.text = existing?.title ?? '';
+    description.text = existing?.description ?? '';
+    String category = existing?.category ?? 'Личное';
+    String priority = existing?.priority ?? 'Средний';
+    DateTime dueDate = existing?.dueDate ?? todayDeadlineUtc();
     final result = await showDialog<bool>(
       context: context,
       builder: (_) => StatefulBuilder(
         builder: (context, set) => AlertDialog(
-          title: const Text('РќРѕРІР°СЏ Р·Р°РґР°С‡Р°'),
+          title: Text(existing == null ? 'Новая задача' : 'Редактировать задачу'),
           content: SizedBox(
             width: 430,
             child: Column(
@@ -1447,7 +1617,7 @@ class _TasksPageState extends State<TasksPage> {
                   controller: title,
                   autofocus: true,
                   decoration: const InputDecoration(
-                    labelText: 'РќР°Р·РІР°РЅРёРµ',
+                    labelText: 'Название',
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -1455,7 +1625,7 @@ class _TasksPageState extends State<TasksPage> {
                   controller: description,
                   maxLines: 2,
                   decoration: const InputDecoration(
-                    labelText: 'РћРїРёСЃР°РЅРёРµ',
+                    labelText: 'Описание',
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -1465,14 +1635,14 @@ class _TasksPageState extends State<TasksPage> {
                       child: DropdownButtonFormField<String>(
                         initialValue: category,
                         decoration: const InputDecoration(
-                          labelText: 'РљР°С‚РµРіРѕСЂРёСЏ',
+                          labelText: 'Категория',
                         ),
                         items:
                             [
-                                  'Р›РёС‡РЅРѕРµ',
-                                  'Р Р°Р±РѕС‚Р°',
-                                  'РЈС‡С‘Р±Р°',
-                                  'РЎРїРѕСЂС‚',
+                                  'Личное',
+                                  'Работа',
+                                  'Учёба',
+                                  'Спорт',
                                 ]
                                 .map(
                                   (x) => DropdownMenuItem(
@@ -1489,10 +1659,10 @@ class _TasksPageState extends State<TasksPage> {
                       child: DropdownButtonFormField<String>(
                         initialValue: priority,
                         decoration: const InputDecoration(
-                          labelText: 'РџСЂРёРѕСЂРёС‚РµС‚',
+                          labelText: 'Приоритет',
                         ),
                         items:
-                            ['Р’С‹СЃРѕРєРёР№', 'РЎСЂРµРґРЅРёР№', 'РќРёР·РєРёР№']
+                            ['Высокий', 'Средний', 'Низкий']
                                 .map(
                                   (x) => DropdownMenuItem(
                                     value: x,
@@ -1505,17 +1675,38 @@ class _TasksPageState extends State<TasksPage> {
                     ),
                   ],
                 ),
+                const SizedBox(height: 12),
+                OutlinedButton.icon(
+                  onPressed: () async {
+                    final picked = await showDatePicker(
+                      context: context,
+                      firstDate: DateTime(2020),
+                      lastDate: DateTime(2100),
+                      initialDate: dueDate.toLocal(),
+                    );
+                    if (picked != null) {
+                      set(() => dueDate = DateTime.utc(
+                            picked.year,
+                            picked.month,
+                            picked.day,
+                            12,
+                          ));
+                    }
+                  },
+                  icon: const Icon(Icons.event_outlined),
+                  label: Text('Дедлайн: ${dateLabel(dueDate)}'),
+                ),
               ],
             ),
           ),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(context),
-              child: const Text('РћС‚РјРµРЅР°'),
+              child: const Text('Отмена'),
             ),
             FilledButton(
               onPressed: () => Navigator.pop(context, true),
-              child: const Text('РЎРѕР·РґР°С‚СЊ'),
+              child: const Text('Создать'),
             ),
           ],
         ),
@@ -1523,28 +1714,54 @@ class _TasksPageState extends State<TasksPage> {
     );
     if (result == true && title.text.trim().isNotEmpty) {
       final task = TaskItem(
+        id: existing?.id ?? '',
         title: title.text,
         description: description.text,
         category: category,
         priority: priority,
-        dueDate: DateTime.now(),
+        dueDate: dueDate,
+        isCompleted: existing?.isCompleted ?? false,
+        completedAt: existing?.completedAt,
+        createdAt: existing?.createdAt,
       );
-      try {
-        widget.store.tasks.insert(0, await widget.store.api.createTask(task));
-      } catch (_) {
-        widget.store.tasks.insert(0, task);
+      if (existing == null) {
+        await widget.store.addTaskFromDialog(task);
+      } else {
+        await widget.store.updateTask(task);
       }
-      widget.store.refresh();
     }
     title.dispose();
     description.dispose();
   }
 }
 
+class _TaskTableHeader extends StatelessWidget {
+  const _TaskTableHeader();
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 6),
+    child: Row(
+      children: const [
+        SizedBox(width: 48, child: Text('')),
+        Expanded(flex: 4, child: Text('Задача')),
+        Expanded(flex: 2, child: Text('Категория')),
+        Expanded(flex: 2, child: Text('Приоритет')),
+        Expanded(flex: 2, child: Text('Дедлайн')),
+        SizedBox(width: 96, child: Text('Действия')),
+      ],
+    ),
+  );
+}
+
 class _TaskTableRow extends StatelessWidget {
-  const _TaskTableRow({required this.task, required this.store});
+  const _TaskTableRow({
+    required this.task,
+    required this.store,
+    required this.onEdit,
+  });
   final TaskItem task;
   final AppStore store;
+  final VoidCallback onEdit;
   @override
   Widget build(BuildContext context) => Padding(
     padding: const EdgeInsets.symmetric(vertical: 11, horizontal: 6),
@@ -1595,7 +1812,7 @@ class _TaskTableRow extends StatelessWidget {
           flex: 2,
           child: Text(
             task.dueDate == null
-                ? 'Р вЂР ВµР В· РЎРѓРЎР‚Р С•Р С”Р В°'
+                ? 'Без срока'
                 : dateLabel(task.dueDate!),
             style: TextStyle(
               color: Theme.of(context).colorScheme.onSurfaceVariant,
@@ -1603,10 +1820,23 @@ class _TaskTableRow extends StatelessWidget {
             ),
           ),
         ),
-        IconButton(
-          onPressed: () => store.removeTask(task),
-          icon: const Icon(Icons.delete_outline),
-          tooltip: 'Р Р€Р Т‘Р В°Р В»Р С‘РЎвЂљРЎРЉ',
+        SizedBox(
+          width: 96,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                onPressed: onEdit,
+                icon: const Icon(Icons.edit_outlined),
+                tooltip: 'Редактировать',
+              ),
+              IconButton(
+                onPressed: () => store.removeTask(task),
+                icon: const Icon(Icons.delete_outline),
+                tooltip: 'Удалить',
+              ),
+            ],
+          ),
         ),
       ],
     ),
@@ -1621,8 +1851,19 @@ class StatsPage extends StatefulWidget {
 }
 
 class _StatsPageState extends State<StatsPage> {
-  String period = '30 Р Т‘Р Р…Р ВµР в„–';
-  String metric = 'Р СџРЎР‚Р С•Р Т‘РЎС“Р С”РЎвЂљР С‘Р Р†Р Р…Р С•РЎРѓРЎвЂљРЎРЉ';
+  String period = '30 дней';
+  String metric = 'Продуктивность';
+  @override
+  void initState() {
+    super.initState();
+    widget.store.loadStatsForPeriod(period);
+  }
+
+  Future<void> _selectPeriod(String value) async {
+    setState(() => period = value);
+    await widget.store.loadStatsForPeriod(value);
+  }
+
   @override
   Widget build(BuildContext context) {
     final days = widget.store.stats;
@@ -1632,26 +1873,26 @@ class _StatsPageState extends State<StatsPage> {
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             const PageTitle(
-              title: 'Р РЋРЎвЂљР В°РЎвЂљР С‘РЎРѓРЎвЂљР С‘Р С”Р В°',
-              subtitle: 'Р СџР С•Р в„–Р СР С‘РЎвЂљР Вµ РЎР‚Р С‘РЎвЂљР С Р С‘ Р С—Р С•Р Т‘Р Т‘Р ВµРЎР‚Р В¶Р С‘Р Р†Р В°Р в„–РЎвЂљР Вµ РЎРѓР Р†Р С•Р в„– РЎвЂљР ВµР СР С—.',
+              title: 'Статистика',
+              subtitle: 'Поймите ритм и поддерживайте свой темп.',
             ),
             SegmentedButton<String>(
               segments: const [
                 ButtonSegment(
-                  value: '7 Р Т‘Р Р…Р ВµР в„–',
-                  label: Text('7 Р Т‘Р Р…Р ВµР в„–'),
+                  value: '7 дней',
+                  label: Text('7 дней'),
                 ),
                 ButtonSegment(
-                  value: '30 Р Т‘Р Р…Р ВµР в„–',
-                  label: Text('30 Р Т‘Р Р…Р ВµР в„–'),
+                  value: '30 дней',
+                  label: Text('30 дней'),
                 ),
                 ButtonSegment(
-                  value: 'Р вЂњР С•Р Т‘',
-                  label: Text('Р вЂњР С•Р Т‘'),
+                  value: 'Год',
+                  label: Text('Год'),
                 ),
               ],
               selected: {period},
-              onSelectionChanged: (v) => setState(() => period = v.first),
+              onSelectionChanged: (v) => _selectPeriod(v.first),
             ),
           ],
         ),
@@ -1661,12 +1902,12 @@ class _StatsPageState extends State<StatsPage> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'Р С™Р В°Р В»Р ВµР Р…Р Т‘Р В°РЎР‚РЎРЉ Р В°Р С”РЎвЂљР С‘Р Р†Р Р…Р С•РЎРѓРЎвЂљР С‘',
+                'Календарь активности',
                 style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
               ),
               const SizedBox(height: 6),
               Text(
-                'Р СњР В°Р Р†Р ВµР Т‘Р С‘РЎвЂљР Вµ Р С”РЎС“РЎР‚РЎРѓР С•РЎР‚ Р Р…Р В° Р Т‘Р ВµР Р…РЎРЉ, РЎвЂЎРЎвЂљР С•Р В±РЎвЂ№ РЎС“Р Р†Р С‘Р Т‘Р ВµРЎвЂљРЎРЉ Р Т‘Р ВµРЎвЂљР В°Р В»Р С‘.',
+                'Наведите курсор на день, чтобы увидеть детали.',
                 style: TextStyle(
                   color: Theme.of(context).colorScheme.onSurfaceVariant,
                   fontSize: 12,
@@ -1676,27 +1917,33 @@ class _StatsPageState extends State<StatsPage> {
               Wrap(
                 spacing: 7,
                 runSpacing: 7,
-                children: List.generate(140, (i) {
-                  final day = days.isEmpty ? null : days[i % days.length];
-                  final color = day == null || day.status == 'empty'
+                children: days.map((day) {
+                  final color = day.status == 'empty'
                       ? Theme.of(context).dividerColor.withOpacity(.28)
                       : day.status == 'complete'
                       ? _green
                       : _green.withOpacity(.45);
+                  final note = day.note.trim().isEmpty
+                      ? '—'
+                      : day.note.trim();
                   return Tooltip(
-                    message: day == null
-                        ? 'Р СњР ВµРЎвЂљ Р Т‘Р В°Р Р…Р Р…РЎвЂ№РЎвЂ¦'
-                        : '${dateLabel(day.date)} Р’В· ${day.completed}/${day.planned} Р В·Р В°Р Т‘Р В°РЎвЂЎ',
+                    message:
+                        '${dateLabel(day.date)}\nВыполнено: ${day.completed}/${day.planned} задач\nОценка: ${day.productivity.toStringAsFixed(1)}/10\nЗаметка: $note',
                     child: Container(
                       width: 18,
                       height: 18,
                       decoration: BoxDecoration(
                         color: color,
+                        border: Border.all(
+                          color: day.status == 'empty'
+                              ? Theme.of(context).dividerColor
+                              : color,
+                        ),
                         borderRadius: BorderRadius.circular(4),
                       ),
                     ),
                   );
-                }),
+                }).toList(),
               ),
             ],
           ),
@@ -1710,28 +1957,28 @@ class _StatsPageState extends State<StatsPage> {
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   const Text(
-                    'Р вЂќР С‘Р Р…Р В°Р СР С‘Р С”Р В°',
+                    'Динамика',
                     style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
                   ),
                   DropdownButton<String>(
                     value: metric,
                     items: const [
                       DropdownMenuItem(
-                        value: 'Р СџРЎР‚Р С•Р Т‘РЎС“Р С”РЎвЂљР С‘Р Р†Р Р…Р С•РЎРѓРЎвЂљРЎРЉ',
+                        value: 'Продуктивность',
                         child: Text(
-                          'Р вЂєР С‘РЎвЂЎР Р…Р В°РЎРЏ Р С•РЎвЂ Р ВµР Р…Р С”Р В°',
+                          'Личная оценка',
                         ),
                       ),
                       DropdownMenuItem(
-                        value: 'Р вЂ”Р В°Р С”РЎР‚РЎвЂ№РЎвЂљР С‘Р Вµ',
+                        value: 'Закрытие',
                         child: Text(
-                          'Р СџРЎР‚Р С•РЎвЂ Р ВµР Р…РЎвЂљ Р В·Р В°Р С”РЎР‚РЎвЂ№РЎвЂљРЎвЂ№РЎвЂ¦ Р В·Р В°Р Т‘Р В°РЎвЂЎ',
+                          'Процент закрытых задач',
                         ),
                       ),
                       DropdownMenuItem(
-                        value: 'Р С™Р С•Р В»Р С‘РЎвЂЎР ВµРЎРѓРЎвЂљР Р†Р С•',
+                        value: 'Количество',
                         child: Text(
-                          'Р вЂ™РЎвЂ№Р С—Р С•Р В»Р Р…Р ВµР Р…Р Р…РЎвЂ№Р Вµ Р В·Р В°Р Т‘Р В°РЎвЂЎР С‘',
+                          'Выполненные задачи',
                         ),
                       ),
                     ],
@@ -1742,7 +1989,11 @@ class _StatsPageState extends State<StatsPage> {
               const SizedBox(height: 20),
               SizedBox(
                 height: 230,
-                child: _LineChart(points: widget.store.stats, metric: metric),
+                child: _LineChart(
+                  points: widget.store.stats,
+                  previous: widget.store.previousStats,
+                  metric: metric,
+                ),
               ),
             ],
           ),
@@ -1753,19 +2004,30 @@ class _StatsPageState extends State<StatsPage> {
 }
 
 class _LineChart extends StatelessWidget {
-  const _LineChart({required this.points, required this.metric});
+  const _LineChart({
+    required this.points,
+    required this.previous,
+    required this.metric,
+  });
   final List<DayStat> points;
+  final List<DayStat> previous;
   final String metric;
   @override
   Widget build(BuildContext context) => CustomPaint(
-    painter: _ChartPainter(points, metric, Theme.of(context).colorScheme),
+    painter: _ChartPainter(
+      points,
+      previous,
+      metric,
+      Theme.of(context).colorScheme,
+    ),
     child: const SizedBox.expand(),
   );
 }
 
 class _ChartPainter extends CustomPainter {
-  _ChartPainter(this.points, this.metric, this.colors);
+  _ChartPainter(this.points, this.previous, this.metric, this.colors);
   final List<DayStat> points;
+  final List<DayStat> previous;
   final String metric;
   final ColorScheme colors;
   @override
@@ -1778,30 +2040,26 @@ class _ChartPainter extends CustomPainter {
       canvas.drawLine(Offset(0, y), Offset(size.width, y), grid);
     }
     if (points.isEmpty) return;
-    final values = points
-        .map(
-          (p) =>
-              metric ==
-                  'Р СџРЎР‚Р С•Р Т‘РЎС“Р С”РЎвЂљР С‘Р Р†Р Р…Р С•РЎРѓРЎвЂљРЎРЉ'
-              ? p.productivity
-              : metric == 'Р вЂ”Р В°Р С”РЎР‚РЎвЂ№РЎвЂљР С‘Р Вµ'
-              ? (p.planned == 0 ? 0 : p.completed * 100 / p.planned)
-              : p.completed.toDouble(),
-        )
-        .toList();
-    final maxValue = math.max(1.0, values.reduce(math.max).toDouble());
-    final path = Path();
-    for (var i = 0; i < values.length; i++) {
-      final double x = values.length == 1
+    final values = points.map(_value).toList();
+    final previousValues = previous.map(_value).toList();
+    final allValues = [...values, ...previousValues];
+    final maxValue = math.max(1.0, allValues.reduce(math.max).toDouble());
+    Path buildPath(List<double> source) {
+      final path = Path();
+      for (var i = 0; i < source.length; i++) {
+      final double x = source.length == 1
           ? 0.0
-          : i * size.width / (values.length - 1);
+          : i * size.width / (source.length - 1);
       final double y =
-          size.height - (values[i] / maxValue) * (size.height - 12) - 6;
+          size.height - (source[i] / maxValue) * (size.height - 12) - 6;
       if (i == 0)
         path.moveTo(x, y);
       else
         path.lineTo(x, y);
+      }
+      return path;
     }
+    final path = buildPath(values);
     final fill = Path.from(path)
       ..lineTo(size.width, size.height)
       ..lineTo(0, size.height)
@@ -1815,11 +2073,43 @@ class _ChartPainter extends CustomPainter {
         ..style = PaintingStyle.stroke
         ..strokeCap = StrokeCap.round,
     );
+    if (previousValues.isNotEmpty) {
+      final previousPath = buildPath(previousValues);
+      final dashed = Paint()
+        ..color = colors.onSurfaceVariant.withOpacity(.55)
+        ..strokeWidth = 2
+        ..style = PaintingStyle.stroke;
+      for (final metric in _dashPath(previousPath, 8, 6)) {
+        canvas.drawPath(metric, dashed);
+      }
+    }
+  }
+
+  double _value(DayStat point) => metric == 'Продуктивность'
+      ? point.productivity
+      : metric == 'Закрытие'
+      ? (point.planned == 0 ? 0 : point.completed * 100 / point.planned)
+      : point.completed.toDouble();
+
+  List<Path> _dashPath(Path source, double dash, double gap) {
+    final result = <Path>[];
+    for (final metric in source.computeMetrics()) {
+      var distance = 0.0;
+      while (distance < metric.length) {
+        final segment = metric.extractPath(
+          distance,
+          math.min(distance + dash, metric.length),
+        );
+        result.add(segment);
+        distance += dash + gap;
+      }
+    }
+    return result;
   }
 
   @override
   bool shouldRepaint(covariant _ChartPainter old) =>
-      old.points != points || old.metric != metric;
+      old.points != points || old.previous != previous || old.metric != metric;
 }
 
 class NutritionPage extends StatefulWidget {
@@ -1830,7 +2120,8 @@ class NutritionPage extends StatefulWidget {
 }
 
 class _NutritionPageState extends State<NutritionPage> {
-  String mealType = 'Р вЂ”Р В°Р Р†РЎвЂљРЎР‚Р В°Р С”';
+  String mealType = 'Завтрак';
+  DateTime selectedDate = DateTime.now();
   FoodProduct? selected;
   final grams = TextEditingController(text: '100');
   final search = TextEditingController();
@@ -1853,8 +2144,27 @@ class _NutritionPageState extends State<NutritionPage> {
     return ListView(
       children: [
         const PageTitle(
-          title: 'Р СџР С‘РЎвЂљР В°Р Р…Р С‘Р Вµ Р С‘ Р вЂР вЂ“Р Р€',
-          subtitle: 'Р РЋР В»Р ВµР Т‘Р С‘РЎвЂљР Вµ Р В·Р В° РЎР‚Р В°РЎвЂ Р С‘Р С•Р Р…Р С•Р С Р В±Р ВµР В· Р В»Р С‘РЎв‚¬Р Р…Р ВµР в„– РЎРѓР В»Р С•Р В¶Р Р…Р С•РЎРѓРЎвЂљР С‘.',
+          title: 'Питание и БЖУ',
+          subtitle: 'Следите за рационом без лишней сложности.',
+        ),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: OutlinedButton.icon(
+            onPressed: () async {
+              final picked = await showDatePicker(
+                context: context,
+                firstDate: DateTime(2020),
+                lastDate: DateTime(2100),
+                initialDate: selectedDate,
+              );
+              if (picked != null) {
+                setState(() => selectedDate = picked);
+                await widget.store.loadMealsForDate(picked);
+              }
+            },
+            icon: const Icon(Icons.calendar_today_outlined),
+            label: Text('Дата: ${dateLabel(selectedDate)}'),
+          ),
         ),
         const SizedBox(height: 20),
         LayoutBuilder(
@@ -1867,31 +2177,31 @@ class _NutritionPageState extends State<NutritionPage> {
             childAspectRatio: 2.2,
             children: [
               _NutritionCard(
-                'Р С™Р В°Р В»Р С•РЎР‚Р С‘Р С‘',
+                'Калории',
                 calories,
                 widget.store.settings.calories,
-                'Р С”Р С”Р В°Р В»',
+                'ккал',
                 const Color(0xFFE85D75),
               ),
               _NutritionCard(
-                'Р вЂР ВµР В»Р С”Р С‘',
+                'Белки',
                 protein,
                 widget.store.settings.protein,
-                'Р С–',
+                'г',
                 _accent,
               ),
               _NutritionCard(
-                'Р вЂ“Р С‘РЎР‚РЎвЂ№',
+                'Жиры',
                 fat,
                 widget.store.settings.fat,
-                'Р С–',
+                'г',
                 _orange,
               ),
               _NutritionCard(
-                'Р Р€Р С–Р В»Р ВµР Р†Р С•Р Т‘РЎвЂ№',
+                'Углеводы',
                 carbs,
                 widget.store.settings.carbs,
-                'Р С–',
+                'г',
                 _green,
               ),
             ],
@@ -1903,7 +2213,7 @@ class _NutritionPageState extends State<NutritionPage> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'Р вЂќР С•Р В±Р В°Р Р†Р С‘РЎвЂљРЎРЉ Р С—РЎР‚Р С‘РЎвЂР С Р С—Р С‘РЎвЂ°Р С‘',
+                'Добавить приём пищи',
                 style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
               ),
               const SizedBox(height: 14),
@@ -1914,14 +2224,14 @@ class _NutritionPageState extends State<NutritionPage> {
                     child: DropdownButtonFormField<String>(
                       value: mealType,
                       decoration: const InputDecoration(
-                        labelText: 'Р СџРЎР‚Р С‘РЎвЂР С Р С—Р С‘РЎвЂ°Р С‘',
+                        labelText: 'Приём пищи',
                       ),
                       items:
                           [
-                                'Р вЂ”Р В°Р Р†РЎвЂљРЎР‚Р В°Р С”',
-                                'Р С›Р В±Р ВµР Т‘',
-                                'Р Р€Р В¶Р С‘Р Р…',
-                                'Р СџР ВµРЎР‚Р ВµР С”РЎС“РЎРѓ',
+                                'Завтрак',
+                                'Обед',
+                                'Ужин',
+                                'Перекус',
                               ]
                               .map(
                                 (x) =>
@@ -1948,7 +2258,7 @@ class _NutritionPageState extends State<NutritionPage> {
                         controller: controller,
                         focusNode: focus,
                         decoration: const InputDecoration(
-                          labelText: 'Р СџРЎР‚Р С•Р Т‘РЎС“Р С”РЎвЂљ',
+                          labelText: 'Продукт',
                           prefixIcon: Icon(Icons.search),
                         ),
                       ),
@@ -1961,7 +2271,7 @@ class _NutritionPageState extends State<NutritionPage> {
                       controller: grams,
                       keyboardType: TextInputType.number,
                       decoration: const InputDecoration(
-                        labelText: 'Р вЂњРЎР‚Р В°Р СР СРЎвЂ№',
+                        labelText: 'Граммы',
                       ),
                     ),
                   ),
@@ -1970,7 +2280,7 @@ class _NutritionPageState extends State<NutritionPage> {
                     padding: const EdgeInsets.only(top: 4),
                     child: FilledButton(
                       onPressed: selected == null ? null : _addMeal,
-                      child: const Text('Р вЂќР С•Р В±Р В°Р Р†Р С‘РЎвЂљРЎРЉ'),
+                      child: const Text('Добавить'),
                     ),
                   ),
                 ],
@@ -1979,13 +2289,21 @@ class _NutritionPageState extends State<NutritionPage> {
                 Padding(
                   padding: const EdgeInsets.only(top: 12),
                   child: Text(
-                    '${selected!.name}: ${selected!.calories} Р С”Р С”Р В°Р В» Р’В· Р вЂ ${selected!.protein} Р’В· Р вЂ“ ${selected!.fat} Р’В· Р Р€ ${selected!.carbs} Р Р…Р В° 100 Р С–',
+                    '${selected!.name}: ${selected!.calories} ккал · Б ${selected!.protein} · Ж ${selected!.fat} · У ${selected!.carbs} на 100 г',
                     style: TextStyle(
                       color: Theme.of(context).colorScheme.onSurfaceVariant,
                       fontSize: 12,
                     ),
                   ),
                 ),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: () => _createProduct(context),
+                  icon: const Icon(Icons.add_circle_outline),
+                  label: const Text('Добавить свой продукт'),
+                ),
+              ),
             ],
           ),
         ),
@@ -1995,19 +2313,19 @@ class _NutritionPageState extends State<NutritionPage> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'Р вЂќР Р…Р ВµР Р†Р Р…Р С‘Р С” Р С—Р С‘РЎвЂљР В°Р Р…Р С‘РЎРЏ',
+                'Дневник питания',
                 style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
               ),
               const SizedBox(height: 12),
               if (widget.store.meals.isEmpty)
                 const Text(
-                  'Р СџРЎР‚Р С‘РЎвЂР СР С•Р Р† Р С—Р С‘РЎвЂ°Р С‘ Р ВµРЎвЂ°РЎвЂ Р Р…Р ВµРЎвЂљ.',
+                  'Приёмов пищи ещё нет.',
                 ),
               for (final group in [
-                'Р вЂ”Р В°Р Р†РЎвЂљРЎР‚Р В°Р С”',
-                'Р С›Р В±Р ВµР Т‘',
-                'Р Р€Р В¶Р С‘Р Р…',
-                'Р СџР ВµРЎР‚Р ВµР С”РЎС“РЎРѓ',
+                'Завтрак',
+                'Обед',
+                'Ужин',
+                'Перекус',
               ]) ...[
                 if (widget.store.meals.any((m) => m.mealType == group))
                   Padding(
@@ -2024,7 +2342,7 @@ class _NutritionPageState extends State<NutritionPage> {
                     contentPadding: EdgeInsets.zero,
                     title: Text(meal.product.name),
                     subtitle: Text(
-                      '${meal.weight.round()} Р С– Р’В· ${meal.calories.round()} Р С”Р С”Р В°Р В»',
+                      '${meal.weight.round()} г · ${meal.calories.round()} ккал',
                     ),
                     trailing: IconButton(
                       onPressed: () => widget.store.removeMeal(meal),
@@ -2045,7 +2363,7 @@ class _NutritionPageState extends State<NutritionPage> {
     final factor = weight / 100;
     widget.store.addMeal(
       MealEntry(
-        date: DateTime.now(),
+        date: selectedDate,
         mealType: mealType,
         product: p,
         weight: weight,
@@ -2059,6 +2377,56 @@ class _NutritionPageState extends State<NutritionPage> {
       selected = null;
       grams.text = '100';
     });
+  }
+
+  Future<void> _createProduct(BuildContext context) async {
+    final name = TextEditingController();
+    final calories = TextEditingController();
+    final protein = TextEditingController();
+    final fat = TextEditingController();
+    final carbs = TextEditingController();
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Новый продукт'),
+        content: SizedBox(
+          width: 420,
+          child: Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              SizedBox(width: 400, child: TextField(controller: name, decoration: const InputDecoration(labelText: 'Название'))),
+              SizedBox(width: 190, child: TextField(controller: calories, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Ккал на 100 г'))),
+              SizedBox(width: 190, child: TextField(controller: protein, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Белки, г'))),
+              SizedBox(width: 190, child: TextField(controller: fat, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Жиры, г'))),
+              SizedBox(width: 190, child: TextField(controller: carbs, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Углеводы, г'))),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Отмена')),
+          FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Сохранить')),
+        ],
+      ),
+    );
+    if (result == true && name.text.trim().isNotEmpty) {
+      final product = await widget.store.addProduct(
+        FoodProduct(
+          name: name.text.trim(),
+          calories: double.tryParse(calories.text.replaceAll(',', '.')) ?? 0,
+          protein: double.tryParse(protein.text.replaceAll(',', '.')) ?? 0,
+          fat: double.tryParse(fat.text.replaceAll(',', '.')) ?? 0,
+          carbs: double.tryParse(carbs.text.replaceAll(',', '.')) ?? 0,
+          isCustom: true,
+        ),
+      );
+      if (product != null && mounted) setState(() => selected = product);
+    }
+    name.dispose();
+    calories.dispose();
+    protein.dispose();
+    fat.dispose();
+    carbs.dispose();
   }
 }
 
@@ -2107,7 +2475,7 @@ class _NutritionCard extends StatelessWidget {
           ),
           const SizedBox(height: 5),
           Text(
-            'Р С‘Р В· ${target.round()} $unit',
+            'из ${target.round()} $unit',
             style: TextStyle(
               color: Theme.of(context).colorScheme.onSurfaceVariant,
               fontSize: 11,
@@ -2153,8 +2521,8 @@ class _SettingsPageState extends State<SettingsPage> {
   Widget build(BuildContext context) => ListView(
     children: [
       const PageTitle(
-        title: 'Р СњР В°РЎРѓРЎвЂљРЎР‚Р С•Р в„–Р С”Р С‘',
-        subtitle: 'Р СњР В°РЎРѓРЎвЂљРЎР‚Р С•Р в„–РЎвЂљР Вµ Р С—РЎР‚Р С‘Р В»Р С•Р В¶Р ВµР Р…Р С‘Р Вµ Р С—Р С•Р Т‘ РЎРѓР Р†Р С•Р в„– РЎР‚Р С‘РЎвЂљР С.',
+        title: 'Настройки',
+        subtitle: 'Настройте приложение под свой ритм.',
       ),
       const SizedBox(height: 20),
       SectionCard(
@@ -2162,25 +2530,25 @@ class _SettingsPageState extends State<SettingsPage> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'Р С›РЎвЂћР С•РЎР‚Р СР В»Р ВµР Р…Р С‘Р Вµ',
+              'Оформление',
               style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
             ),
             const SizedBox(height: 12),
             DropdownButtonFormField<String>(
               value: widget.store.settings.themeMode,
-              decoration: const InputDecoration(labelText: 'Р СћР ВµР СР В°'),
+              decoration: const InputDecoration(labelText: 'Тема'),
               items: const [
                 DropdownMenuItem(
                   value: 'system',
-                  child: Text('Р РЋР С‘РЎРѓРЎвЂљР ВµР СР Р…Р В°РЎРЏ'),
+                  child: Text('Системная'),
                 ),
                 DropdownMenuItem(
                   value: 'light',
-                  child: Text('Р РЋР Р†Р ВµРЎвЂљР В»Р В°РЎРЏ'),
+                  child: Text('Светлая'),
                 ),
                 DropdownMenuItem(
                   value: 'dark',
-                  child: Text('Р СћРЎвЂР СР Р…Р В°РЎРЏ'),
+                  child: Text('Тёмная'),
                 ),
               ],
               onChanged: (v) {
@@ -2196,7 +2564,7 @@ class _SettingsPageState extends State<SettingsPage> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'Р В¦Р ВµР В»Р ВµР Р†РЎвЂ№Р Вµ Р Р…Р С•РЎР‚Р СРЎвЂ№',
+              'Целевые нормы',
               style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
             ),
             const SizedBox(height: 14),
@@ -2205,14 +2573,14 @@ class _SettingsPageState extends State<SettingsPage> {
               runSpacing: 12,
               children: [
                 _numberField(
-                  'Р С™Р В°Р В»Р С•РЎР‚Р С‘Р С‘, Р С”Р С”Р В°Р В»',
+                  'Калории, ккал',
                   calories,
                 ),
-                _numberField('Р вЂР ВµР В»Р С”Р С‘, Р С–', protein),
-                _numberField('Р вЂ“Р С‘РЎР‚РЎвЂ№, Р С–', fat),
-                _numberField('Р Р€Р С–Р В»Р ВµР Р†Р С•Р Т‘РЎвЂ№, Р С–', carbs),
+                _numberField('Белки, г', protein),
+                _numberField('Жиры, г', fat),
+                _numberField('Углеводы, г', carbs),
                 _numberField(
-                  'Р СљР С‘Р Р…Р С‘Р СРЎС“Р С Р В·Р В°Р Т‘Р В°РЎвЂЎ',
+                  'Минимум задач',
                   minTasks,
                 ),
               ],
@@ -2222,7 +2590,7 @@ class _SettingsPageState extends State<SettingsPage> {
               onPressed: _save,
               icon: const Icon(Icons.save_outlined),
               label: const Text(
-                'Р РЋР С•РЎвЂ¦РЎР‚Р В°Р Р…Р С‘РЎвЂљРЎРЉ Р Р…Р С•РЎР‚Р СРЎвЂ№',
+                'Сохранить нормы',
               ),
             ),
           ],
@@ -2237,12 +2605,12 @@ class _SettingsPageState extends State<SettingsPage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Р В­Р С”РЎРѓР С—Р С•РЎР‚РЎвЂљ Р Т‘Р В°Р Р…Р Р…РЎвЂ№РЎвЂ¦',
+                    'Экспорт данных',
                     style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
                   ),
                   SizedBox(height: 4),
                   Text(
-                    'Р РЋР С•РЎвЂ¦РЎР‚Р В°Р Р…Р С‘РЎвЂљРЎРЉ Р Р†РЎРѓР Вµ Р В·Р В°Р Т‘Р В°РЎвЂЎР С‘, Р С—Р С‘РЎвЂљР В°Р Р…Р С‘Р Вµ Р С‘ РЎРѓРЎвЂљР В°РЎвЂљР С‘РЎРѓРЎвЂљР С‘Р С”РЎС“ Р Р† JSON.',
+                    'Сохранить все задачи, питание и статистику в JSON.',
                   ),
                 ],
               ),
@@ -2250,7 +2618,7 @@ class _SettingsPageState extends State<SettingsPage> {
             OutlinedButton.icon(
               onPressed: _export,
               icon: const Icon(Icons.download_outlined),
-              label: const Text('Р В­Р С”РЎРѓР С—Р С•РЎР‚РЎвЂљ JSON'),
+              label: const Text('Экспорт JSON'),
             ),
           ],
         ),
@@ -2281,7 +2649,7 @@ class _SettingsPageState extends State<SettingsPage> {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
         content: Text(
-          'Р СњР В°РЎРѓРЎвЂљРЎР‚Р С•Р в„–Р С”Р С‘ РЎРѓР С•РЎвЂ¦РЎР‚Р В°Р Р…Р ВµР Р…РЎвЂ№',
+          'Настройки сохранены',
         ),
       ),
     );
@@ -2289,10 +2657,15 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _export() async {
     final data = await widget.store.exportJson();
+    final directory = await getApplicationDocumentsDirectory();
+    final file = File(
+      '${directory.path}${Platform.pathSeparator}todo-export-${dateKey(DateTime.now())}.json',
+    );
+    await file.writeAsString(data, flush: true);
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(
-          'Р В­Р С”РЎРѓР С—Р С•РЎР‚РЎвЂљ Р С—Р С•Р Т‘Р С–Р С•РЎвЂљР С•Р Р†Р В»Р ВµР Р… (${data.length} РЎРѓР С‘Р СР Р†Р С•Р В»Р С•Р Р†)',
+          'JSON сохранён: ${file.path}',
         ),
       ),
     );
