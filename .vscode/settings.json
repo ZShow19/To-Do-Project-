@@ -1,0 +1,9 @@
+﻿{
+  "dart.flutterSdkPath": "${workspaceFolder}/flutter",
+  "dart.env": {
+    "APPDATA": "${workspaceFolder}/.appdata"
+  },
+  "terminal.integrated.env.windows": {
+    "APPDATA": "${workspaceFolder}/.appdata"
+  }
+}

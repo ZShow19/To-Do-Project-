@@ -1,0 +1,10 @@
+namespace Todo.Api.Models;
+
+public sealed class TodoTask { public Guid Id { get; set; } public string Title { get; set; } = ""; public string Description { get; set; } = ""; public string Category { get; set; } = "Личное"; public string Priority { get; set; } = "Средний"; public DateTime? DueDateUtc { get; set; } public bool IsCompleted { get; set; } public DateTime? CompletedAtUtc { get; set; } public DateTime CreatedAtUtc { get; set; } }
+public sealed class DailyLog { public DateOnly Date { get; set; } public double ProductivityScore { get; set; } = 5; public string Note { get; set; } = ""; }
+public sealed class FoodProduct { public Guid Id { get; set; } public string Name { get; set; } = ""; public double CaloriesPer100g { get; set; } public double ProteinPer100g { get; set; } public double FatPer100g { get; set; } public double CarbsPer100g { get; set; } public bool IsCustom { get; set; } }
+public sealed class MealEntry { public Guid Id { get; set; } public DateOnly Date { get; set; } public string MealType { get; set; } = "Перекус"; public Guid ProductId { get; set; } public FoodProduct? Product { get; set; } public double WeightGrams { get; set; } public double CalculatedCalories { get; set; } public double CalculatedProtein { get; set; } public double CalculatedFat { get; set; } public double CalculatedCarbs { get; set; } }
+public sealed class UserSettings { public int Id { get; set; } public string ThemeMode { get; set; } = "system"; public double TargetCalories { get; set; } = 2200; public double TargetProtein { get; set; } = 140; public double TargetFat { get; set; } = 70; public double TargetCarbs { get; set; } = 240; public int MinimumTasksPerDay { get; set; } = 3; }
+public sealed record DayStat(DateOnly Date, int PlannedTasks, int CompletedTasks, string Status, double ProductivityScore, string Note, double Calories, double Protein, double Fat, double Carbs);
+public sealed record MetricPoint(DateOnly Date, double Productivity, double CompletionPercent, int CompletedTasks);
+public sealed record StatsResponse(IReadOnlyList<DayStat> Days, IReadOnlyList<MetricPoint> Points);

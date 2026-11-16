@@ -1,0 +1,15 @@
+﻿# Flutter SDK and local caches
+flutter/
+.appdata/
+.dotnet_home/
+.nuget/
+.nuget_packages/
+**/.dart_tool/
+**/build/
+**/todo.db
+**/obj/
+**/bin/
+frontend/flutter_*.log
+# IDE
+.idea/
+.vscode/*.log
