@@ -98,6 +98,24 @@ DateTime todayDeadlineUtc() {
 String dateLabel(DateTime value) =>
     '${value.day.toString().padLeft(2, '0')}.${value.month.toString().padLeft(2, '0')}.${value.year}';
 
+String monthLabel(DateTime value) {
+  const months = [
+    'Январь',
+    'Февраль',
+    'Март',
+    'Апрель',
+    'Май',
+    'Июнь',
+    'Июль',
+    'Август',
+    'Сентябрь',
+    'Октябрь',
+    'Ноябрь',
+    'Декабрь',
+  ];
+  return '${months[value.month - 1]} ${value.year}';
+}
+
 class TaskItem {
   TaskItem({
     this.id = '',
@@ -1912,37 +1930,72 @@ class _StatsPageState extends State<StatsPage> {
                 ),
               ),
               const SizedBox(height: 18),
-              Wrap(
-                spacing: 7,
-                runSpacing: 7,
-                children: days.map((day) {
-                  final color = day.status == 'empty'
-                      ? Theme.of(context).dividerColor.withOpacity(.28)
-                      : day.status == 'complete'
-                      ? _green
-                      : _green.withOpacity(.45);
-                  final note = day.note.trim().isEmpty
-                      ? '—'
-                      : day.note.trim();
-                  return Tooltip(
-                    message:
-                        '${dateLabel(day.date)}\nВыполнено: ${day.completed}/${day.planned} задач\nОценка: ${day.productivity.toStringAsFixed(1)}/10\nЗаметка: $note',
-                    child: Container(
-                      width: 18,
-                      height: 18,
-                      decoration: BoxDecoration(
-                        color: color,
-                        border: Border.all(
-                          color: day.status == 'empty'
-                              ? Theme.of(context).dividerColor
-                              : color,
+              if (days.isNotEmpty)
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (var i = 0; i < days.length; i++)
+                      if (i == 0 || days[i].date.month != days[i - 1].date.month)
+                        Text(
+                          monthLabel(days[i].date),
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.onSurfaceVariant,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                          ),
                         ),
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                    ),
-                  );
-                }).toList(),
-              ),
+                  ],
+                ),
+              const SizedBox(height: 10),
+              if (days.isNotEmpty)
+                Builder(
+                  builder: (context) {
+                    final leading = (days.first.date.weekday - 1) % 7;
+                    final cells = <DayStat?>[
+                      ...List<DayStat?>.filled(leading, null),
+                      ...days,
+                    ];
+                    return GridView.builder(
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      gridDelegate:
+                          const SliverGridDelegateWithFixedCrossAxisCount(
+                            crossAxisCount: 7,
+                            crossAxisSpacing: 7,
+                            mainAxisSpacing: 7,
+                          ),
+                      itemCount: cells.length,
+                      itemBuilder: (_, index) {
+                        final day = cells[index];
+                        if (day == null) return const SizedBox.shrink();
+                        final color = day.status == 'empty'
+                            ? Theme.of(context).dividerColor.withOpacity(.28)
+                            : day.status == 'complete'
+                            ? _green
+                            : _green.withOpacity(.45);
+                        final note = day.note.trim().isEmpty
+                            ? '—'
+                            : day.note.trim();
+                        return Tooltip(
+                          message:
+                              '${dateLabel(day.date)}\nВыполнено: ${day.completed}/${day.planned} задач\nОценка: ${day.productivity.toStringAsFixed(1)}/10\nЗаметка: $note',
+                          child: Container(
+                            decoration: BoxDecoration(
+                              color: color,
+                              border: Border.all(
+                                color: day.status == 'empty'
+                                    ? Theme.of(context).dividerColor
+                                    : color,
+                              ),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                          ),
+                        );
+                      },
+                    );
+                  },
+                ),
             ],
           ),
         ),
