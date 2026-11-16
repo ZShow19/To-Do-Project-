@@ -1853,11 +1853,6 @@ class StatsPage extends StatefulWidget {
 class _StatsPageState extends State<StatsPage> {
   String period = '30 дней';
   String metric = 'Продуктивность';
-  @override
-  void initState() {
-    super.initState();
-    widget.store.loadStatsForPeriod(period);
-  }
 
   Future<void> _selectPeriod(String value) async {
     setState(() => period = value);
